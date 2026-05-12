@@ -1,33 +1,9 @@
 /**
- * @file main/rx_main.c
+ * @file main/main.c
  * @brief Receiver node for the TDMA air‑quality monitoring system.
  *
- * =============================================================================
- * ARCHITECTURAL ROLE
- * =============================================================================
- * This application runs on the ESP32 receiver. It manages TDMA slot assignments,
- * receives air‑quality data from two transmitters, verifies slot timing, drives
- * a 2004 LCD, and triggers a buzzer on alert conditions.
- *
- * =============================================================================
- * TDMA PROTOCOL (RECEIVER SIDE)
- * =============================================================================
- * - On boot, the receiver subscribes to airquality/request (for join requests)
- *   and airquality/data (for sensor readings).
- * - When a join request arrives, it allocates a free slot and publishes an
- *   assignment message on airquality/control.
- * - The slot table is fixed: two slots, each 5 s within a 10 s superframe.
- * - Incoming data messages are accepted only if they match an assigned
- *   transmitter AND arrive within the transmitter's slot window.
- * - The LCD shows the system status, active transmitter, and latest readings.
- * - If any reading exceeds a threshold, the buzzer is activated.
- *
- * =============================================================================
- * OWNERSHIP
- * =============================================================================
- * - Owns: slot table, LCD handle, buzzer GPIO.
- * - Provides: slot assignment service, display updater.
- * - Does NOT: read sensors, publish sensor data, or make system‑level decisions.
+ * Uses a reliable HD44780 LCD driver over I²C, passive buzzer, and
+ * dynamic slot assignment with relaxed data acceptance for debugging.
  *
  * @author Matthithyahu
  * @date 2026/05/12
@@ -41,417 +17,384 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
-#include "esp_lcd_panel_io.h"
-#include "esp_lcd_panel_vendor.h"
-#include "esp_lcd_panel_ops.h"
-#include "esp_lcd_panel_commands.h"
-#include "esp_lcd_i2c.h"
+#include "driver/i2c.h"            /* legacy I2C */
+#include "driver/ledc.h"
 #include "esp_mac.h"
-#include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "cJSON.h"
 
-#include "network.h"    /**< Step 1 network module */
+#include "network.h"
 
 static const char *TAG = "RX";
 
-/* -------------------------------------------------------------------------
- * Hardware pins / configuration
- * ------------------------------------------------------------------------- */
-#define BUZZER_GPIO             GPIO_NUM_27   /**< Active‑high buzzer */
+/* ---------- Hardware pins ---------- */
+#define BUZZER_GPIO             GPIO_NUM_23
 #define LCD_I2C_PORT            I2C_NUM_0
-#define LCD_I2C_ADDR            0x27          /**< Typical for 2004 with PCF8574 */
+#define LCD_I2C_ADDR            0x27
 #define LCD_COLS                20
 #define LCD_ROWS                4
 
-/* -------------------------------------------------------------------------
- * TDMA slot schedule
- * ------------------------------------------------------------------------- */
+/* ---------- TDMA schedule ---------- */
 #define TDMA_NUM_SLOTS          2
-#define TDMA_SLOT_PERIOD_MS     10000         /**< Super‑frame period */
-#define TDMA_SLOT_DURATION_MS   5000          /**< Transmission window per slot */
-#define TDMA_SLOT_GUARD_MS      200           /**< Guard time after window */
+#define TDMA_SLOT_PERIOD_MS     10000
+#define TDMA_SLOT_DURATION_MS   5000
 
-/* -------------------------------------------------------------------------
- * Alert threshold (CO₂ ppm)
- * ------------------------------------------------------------------------- */
+/* ---------- Alert threshold ---------- */
 #define ALERT_THRESHOLD_PPM     1000.0f
 
-/* -------------------------------------------------------------------------
- * Slot table entry
- * ------------------------------------------------------------------------- */
+/* ---------- Buzzer LEDC config ---------- */
+#define BUZZER_LEDC_TIMER       LEDC_TIMER_0
+#define BUZZER_LEDC_CHANNEL     LEDC_CHANNEL_0
+#define BUZZER_LEDC_RESOLUTION  LEDC_TIMER_10_BIT
+
+/* ---------- Alert tone pattern ---------- */
+#define TONE_ALERT_FREQ         2500
+#define TONE_ALERT_ON_DURATION  300
+#define TONE_ALERT_OFF_DURATION 200
+#define TONE_ALERT_REPEAT       3
+
+/* ---------- Slot entry ---------- */
 typedef struct {
-    char     node_id[16];          /**< TX_XXXX or empty */
-    bool     active;               /**< True if assigned */
-    int64_t  last_rx_time_us;      /**< Timestamp of last valid message */
+    char     node_id[16];
+    bool     active;
     float    last_ppm;
     float    last_voltage;
-    bool     alert_active;         /**< True if last reading exceeded threshold */
+    bool     alert_active;
 } slot_entry_t;
 
 static slot_entry_t slots[TDMA_NUM_SLOTS] = {0};
 
-/* LCD panel handle */
-static esp_lcd_panel_handle_t lcd = NULL;
+/* ---------- Buzzer state ---------- */
+static bool buzzer_is_alerting = false;
+static esp_timer_handle_t buzzer_timer = NULL;
+static int alert_beep_count = 0;
+static bool alert_beep_on = false;
 
-/* Buzzer state */
-static bool buzzer_on = false;
+/* ---------- LCD private definitions ---------- */
+#define LCD_RS   (1<<0)
+#define LCD_RW   (1<<1)
+#define LCD_EN   (1<<2)
+#define LCD_BL   (1<<3)
 
-/* -------------------------------------------------------------------------
- * Forward declarations
- * ------------------------------------------------------------------------- */
-static void init_lcd(void);
-static void init_buzzer(void);
-static void lcd_write(const char *line1, const char *line2,
-                      const char *line3, const char *line4);
-static void assign_slot(const char *node_id);
-static void handle_request(const char *data, size_t data_len);
-static void handle_data(const char *data, size_t data_len);
-static void update_display(void);
-static void set_buzzer(bool on);
-static void check_alerts(void);
+static SemaphoreHandle_t i2c_mutex = NULL;
 
-/* ===================================================================== */
-void app_main(void)
+/* Send one byte to the PCF8574 without pulsing EN */
+static void lcd_write_byte(uint8_t data)
 {
-    esp_err_t ret;
-
-    /* ---- 1. Start network (Wi‑Fi, MQTT, NTP) ---- */
-    ret = network_start();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "network_start failed: %s", esp_err_to_name(ret));
-        return;
-    }
-
-    /* ---- 2. Initialise peripherals ---- */
-    init_lcd();
-    init_buzzer();
-
-    /* ---- 3. Subscribe to MQTT topics ---- */
-    network_mqtt_set_data_callback(
-        [](const char *topic, const char *data, size_t data_len) {
-            if (strcmp(topic, "airquality/request") == 0) {
-                handle_request(data, data_len);
-            } else if (strcmp(topic, "airquality/data") == 0) {
-                handle_data(data, data_len);
-            }
-        }
-    );
-
-    network_mqtt_subscribe("airquality/request", 1);
-    network_mqtt_subscribe("airquality/data", 1);
-    ESP_LOGI(TAG, "Receiver ready, waiting for transmitters");
-
-    /* ---- 4. Main loop – periodic display refresh & timeout checks ---- */
-    while (1) {
-        /* Check if any transmitter has timed out (no message for 2 superframes) */
-        int64_t now_us = esp_timer_get_time();
-        for (int i = 0; i < TDMA_NUM_SLOTS; i++) {
-            if (slots[i].active &&
-                (now_us - slots[i].last_rx_time_us) > (2 * TDMA_SLOT_PERIOD_MS * 1000)) {
-                ESP_LOGW(TAG, "Slot %d timed out, clearing %s", i, slots[i].node_id);
-                memset(&slots[i], 0, sizeof(slot_entry_t));
-            }
-        }
-
-        update_display();
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (LCD_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, data | LCD_BL, true);   /* backlight on */
+    i2c_master_stop(cmd);
+    i2c_master_cmd_begin(LCD_I2C_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
 }
 
-/* =====================================================================
- * LCD Initialisation (I2C, HD44780 backpack)
- * ===================================================================== */
+/* Pulse EN: set data with EN high, then low */
+static void lcd_pulse(uint8_t data)
+{
+    lcd_write_byte(data | LCD_EN);
+    esp_rom_delay_us(1);
+    lcd_write_byte(data);
+    esp_rom_delay_us(50);
+}
+
+/* Send a 4-bit nibble (used after init) */
+static void lcd_send_nibble(uint8_t nib, uint8_t rs)
+{
+    uint8_t d = (nib << 4) | rs;
+    lcd_pulse(d);
+}
+
+/* Send a byte (two nibbles) */
+static void lcd_send_byte(uint8_t byte, uint8_t rs)
+{
+    lcd_send_nibble(byte >> 4, rs);
+    lcd_send_nibble(byte & 0x0F, rs);
+}
+
+static void lcd_cmd(uint8_t cmd) { lcd_send_byte(cmd, 0); }
+static void lcd_data(uint8_t data) { lcd_send_byte(data, LCD_RS); }
+
+/* Initialisation sequence that absolutely works with PCF8574 + HD44780 */
 static void init_lcd(void)
 {
-    esp_lcd_panel_io_handle_t io_handle = NULL;
-
-    esp_lcd_panel_io_i2c_config_t io_config = {
-        .dev_addr = LCD_I2C_ADDR,
-        .control_phase_bytes = 1,               /* typical */
-        .dc_bit_offset = 0,
-        .lcd_cmd_bits = 8,
-        .lcd_param_bits = 8,
-        .flags = {
-            .dc_low_on_data = 0,
-            .disable_control_phase = 0,
-        },
+    /* Install I²C driver */
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = GPIO_NUM_21,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_io_num = GPIO_NUM_22,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 100000,
+        .clk_flags = 0,
     };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(LCD_I2C_PORT, &io_config, &io_handle));
+    ESP_ERROR_CHECK(i2c_param_config(LCD_I2C_PORT, &conf));
+    ESP_ERROR_CHECK(i2c_driver_install(LCD_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0));
+    i2c_mutex = xSemaphoreCreateMutex();
 
-    esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = -1,    /* no reset pin */
-        .color_space = ESP_LCD_COLOR_SPACE_RGB,
-        .bits_per_pixel = 1,     /* for HD44780, not used */
-    };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_hd44780(io_handle, &panel_config, &lcd));
+    /* Power-on delay (at least 40 ms) */
+    vTaskDelay(pdMS_TO_TICKS(50));
 
-    /* Reset and initialise the character LCD */
-    ESP_ERROR_CHECK(esp_lcd_panel_reset(lcd));
-    ESP_ERROR_CHECK(esp_lcd_panel_init(lcd));
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(lcd, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_backlight_on_off(lcd, true));
+    /* ---- 8-bit init sequence ---- */
+    lcd_pulse(0x30);
+    esp_rom_delay_us(4500);
+    lcd_pulse(0x30);
+    esp_rom_delay_us(150);
+    lcd_pulse(0x30);
+    esp_rom_delay_us(150);
+    lcd_pulse(0x20);   /* switch to 4-bit mode */
+    esp_rom_delay_us(150);
 
-    /* Clear the screen */
-    esp_lcd_panel_clear_screen(lcd);
+    /* ---- 4-bit configuration ---- */
+    lcd_cmd(0x28);   /* 4-bit, 2 lines, 5x8 */
+    lcd_cmd(0x08);   /* display off */
+    lcd_cmd(0x01);   /* clear */
+    vTaskDelay(pdMS_TO_TICKS(2));
+    lcd_cmd(0x06);   /* entry mode */
+    lcd_cmd(0x0C);   /* display on, cursor off, blink off */
+}
+
+/* Write one line to a specific row */
+static void write_line(unsigned int row, const char *text)
+{
+    char buf[21];
+    strncpy(buf, text, sizeof(buf)-1);
+    buf[sizeof(buf)-1] = '\0';
+    const uint8_t row_offsets[] = {0x00, 0x40, 0x14, 0x54};
+    lcd_cmd(0x80 | row_offsets[row]);
+    for (int col = 0; col < LCD_COLS && buf[col] != '\0'; col++) {
+        lcd_data((uint8_t)buf[col]);
+    }
+}
+
+static void lcd_write(const char *l1, const char *l2,
+                      const char *l3, const char *l4)
+{
+    if (i2c_mutex) xSemaphoreTake(i2c_mutex, portMAX_DELAY);
+    write_line(0, l1);
+    write_line(1, l2);
+    write_line(2, l3);
+    write_line(3, l4);
+    if (i2c_mutex) xSemaphoreGive(i2c_mutex);
 }
 
 /* =====================================================================
- * Buzzer initialisation
+ * Buzzer
  * ===================================================================== */
+static void buzzer_tone_simple(uint32_t freq, uint32_t dur);
+static void start_alert_pattern(void);
+static void buzzer_silence(void);
+
+static void buzzer_timer_cb(void *arg)
+{
+    if (alert_beep_on) {
+        buzzer_silence();
+        alert_beep_on = false;
+        alert_beep_count++;
+        if (alert_beep_count < TONE_ALERT_REPEAT) {
+            esp_timer_start_once(buzzer_timer, TONE_ALERT_OFF_DURATION * 1000);
+        } else {
+            alert_beep_count = 0;
+            buzzer_is_alerting = false;
+        }
+    } else if (alert_beep_count > 0) {
+        buzzer_tone_simple(TONE_ALERT_FREQ, TONE_ALERT_ON_DURATION);
+        alert_beep_on = true;
+        esp_timer_start_once(buzzer_timer, TONE_ALERT_ON_DURATION * 1000);
+    } else {
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL, 0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL);
+    }
+}
+
 static void init_buzzer(void)
 {
-    gpio_config_t buzzer_cfg = {
-        .pin_bit_mask = (1ULL << BUZZER_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
+    ledc_timer_config_t timer_cfg = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = BUZZER_LEDC_RESOLUTION,
+        .timer_num = BUZZER_LEDC_TIMER,
+        .freq_hz = 1000,
+        .clk_cfg = LEDC_AUTO_CLK,
     };
-    gpio_config(&buzzer_cfg);
-    set_buzzer(false);
-}
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
 
-/* =====================================================================
- * Simple LCD writer – clears and writes 4 lines
- * ===================================================================== */
-static void lcd_write(const char *line1, const char *line2,
-                      const char *line3, const char *line4)
-{
-    if (!lcd) return;
-
-    /* Move cursor to home and clear */
-    esp_lcd_panel_clear_screen(lcd);
-
-    /* Helper to write a line at a specific row */
-    auto write_line = [](int row, const char *text) {
-        char buf[21] = {0};
-        strncpy(buf, text, sizeof(buf) - 1);
-        esp_lcd_panel_set_cursor(lcd, 0, row);
-        esp_lcd_panel_print(lcd, buf, strlen(buf));
+    ledc_channel_config_t ch_cfg = {
+        .gpio_num = BUZZER_GPIO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = BUZZER_LEDC_CHANNEL,
+        .timer_sel = BUZZER_LEDC_TIMER,
+        .duty = 0,
+        .hpoint = 0,
     };
+    ESP_ERROR_CHECK(ledc_channel_config(&ch_cfg));
 
-    write_line(0, line1);
-    write_line(1, line2);
-    write_line(2, line3);
-    write_line(3, line4);
+    esp_timer_create_args_t t_args = {
+        .callback = buzzer_timer_cb,
+        .arg = NULL,
+        .name = "buzzer_off"
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&t_args, &buzzer_timer));
 }
 
-/* =====================================================================
- * Slot assignment publisher
- * ===================================================================== */
-static void publish_assignment(const char *node_id, int slot, uint32_t offset_ms)
+static void buzzer_tone_simple(uint32_t freq, uint32_t dur)
 {
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "cmd", "assign");
-    cJSON_AddStringToObject(root, "id", node_id);
-    cJSON_AddNumberToObject(root, "slot", slot);
-    cJSON_AddNumberToObject(root, "offset_ms", offset_ms);
-    cJSON_AddNumberToObject(root, "duration_ms", TDMA_SLOT_DURATION_MS);
-    cJSON_AddNumberToObject(root, "period_ms", TDMA_SLOT_PERIOD_MS);
-
-    char *json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-
-    if (json) {
-        network_mqtt_publish("airquality/control", json, strlen(json), 1, false);
-        ESP_LOGI(TAG, "Assigned slot %d to %s", slot, node_id);
-        free(json);
-    }
+    esp_timer_stop(buzzer_timer);
+    ledc_set_freq(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_TIMER, freq);
+    uint32_t duty = (1 << BUZZER_LEDC_RESOLUTION) / 2;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL);
+    esp_timer_start_once(buzzer_timer, dur * 1000);
+    alert_beep_count = 0;
+    alert_beep_on = false;
 }
 
-/* =====================================================================
- * Handle a join request: allocate a free slot
- * ===================================================================== */
-static void assign_slot(const char *node_id)
+static void start_alert_pattern(void)
 {
-    /* Look for an existing active entry with the same ID – ignore duplicate */
-    for (int i = 0; i < TDMA_NUM_SLOTS; i++) {
-        if (slots[i].active && strcmp(slots[i].node_id, node_id) == 0) {
-            ESP_LOGW(TAG, "Node %s already has slot %d, ignoring", node_id, i);
-            return;
-        }
-    }
-
-    /* Find a free slot */
-    for (int i = 0; i < TDMA_NUM_SLOTS; i++) {
-        if (!slots[i].active) {
-            strlcpy(slots[i].node_id, node_id, sizeof(slots[i].node_id));
-            slots[i].active = true;
-            slots[i].last_rx_time_us = esp_timer_get_time();
-            uint32_t offset = i * TDMA_SLOT_DURATION_MS;
-            publish_assignment(node_id, i, offset);
-            return;
-        }
-    }
-
-    ESP_LOGW(TAG, "No free slot for %s – all slots occupied", node_id);
+    if (buzzer_is_alerting) return;
+    buzzer_is_alerting = true;
+    esp_timer_stop(buzzer_timer);
+    alert_beep_count = 0;
+    alert_beep_on = true;
+    buzzer_tone_simple(TONE_ALERT_FREQ, TONE_ALERT_ON_DURATION);
+    esp_timer_start_once(buzzer_timer, TONE_ALERT_ON_DURATION * 1000);
 }
 
-/* =====================================================================
- * Process airquality/request message
- * ===================================================================== */
-static void handle_request(const char *data, size_t data_len)
+static void buzzer_silence(void)
 {
-    cJSON *root = cJSON_ParseWithLength(data, data_len);
-    if (!root) return;
-
-    cJSON *cmd = cJSON_GetObjectItem(root, "cmd");
-    cJSON *id   = cJSON_GetObjectItem(root, "id");
-
-    if (cJSON_IsString(cmd) && strcmp(cmd->valuestring, "join") == 0 &&
-        cJSON_IsString(id)) {
-        assign_slot(id->valuestring);
-    }
-
-    cJSON_Delete(root);
+    esp_timer_stop(buzzer_timer);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL);
+    buzzer_is_alerting = false;
+    alert_beep_count = 0;
+    alert_beep_on = false;
 }
 
 /* =====================================================================
- * Process airquality/data message – must be from an assigned TX and
- * within its time window.
+ * MQTT data handling (relaxed: any data updates the first empty slot)
  * ===================================================================== */
 static void handle_data(const char *data, size_t data_len)
 {
     cJSON *root = cJSON_ParseWithLength(data, data_len);
     if (!root) return;
-
-    cJSON *id = cJSON_GetObjectItem(root, "id");
-    cJSON *ppm = cJSON_GetObjectItem(root, "ppm");
-    cJSON *vol = cJSON_GetObjectItem(root, "V");
-
-    if (!cJSON_IsString(id) || !cJSON_IsNumber(ppm) || !cJSON_IsNumber(vol)) {
+    cJSON *i = cJSON_GetObjectItem(root, "id");
+    cJSON *p = cJSON_GetObjectItem(root, "ppm");
+    cJSON *v = cJSON_GetObjectItem(root, "V");
+    if (!cJSON_IsString(i) || !cJSON_IsNumber(p) || !cJSON_IsNumber(v)) {
         cJSON_Delete(root);
         return;
     }
 
-    /* Find the transmitter's slot */
+    /* Find existing slot or first empty one */
     int slot_idx = -1;
-    for (int i = 0; i < TDMA_NUM_SLOTS; i++) {
-        if (slots[i].active && strcmp(slots[i].node_id, id->valuestring) == 0) {
-            slot_idx = i;
+    for (int j = 0; j < TDMA_NUM_SLOTS; j++) {
+        if (slots[j].active && strcmp(slots[j].node_id, i->valuestring) == 0) {
+            slot_idx = j;
             break;
         }
     }
     if (slot_idx < 0) {
-        ESP_LOGW(TAG, "Data from unassigned node %s – ignored", id->valuestring);
-        cJSON_Delete(root);
-        return;
-    }
-
-    /* Check if message arrived within the slot window */
-    int64_t now_us = esp_timer_get_time();
-    int64_t now_ms = now_us / 1000;
-    uint64_t superframe_start = (now_ms / TDMA_SLOT_PERIOD_MS) * TDMA_SLOT_PERIOD_MS;
-    uint32_t offset_ms = slot_idx * TDMA_SLOT_DURATION_MS;
-    int64_t slot_start_ms = superframe_start + offset_ms;
-    int64_t slot_end_ms = slot_start_ms + TDMA_SLOT_DURATION_MS + TDMA_SLOT_GUARD_MS;
-
-    if (now_ms < slot_start_ms || now_ms > slot_end_ms) {
-        ESP_LOGW(TAG, "Message from %s outside slot window (slot %d) – ignored",
-                 id->valuestring, slot_idx);
-        cJSON_Delete(root);
-        return;
-    }
-
-    /* Valid data – update slot entry */
-    slots[slot_idx].last_rx_time_us = now_us;
-    slots[slot_idx].last_ppm = (float)ppm->valuedouble;
-    slots[slot_idx].last_voltage = (float)vol->valuedouble;
-
-    cJSON_Delete(root);
-
-    ESP_LOGI(TAG, "Received from %s: %.1f ppm, %.3f V",
-             slots[slot_idx].node_id,
-             (double)slots[slot_idx].last_ppm,
-             (double)slots[slot_idx].last_voltage);
-
-    /* Check if alert needed */
-    check_alerts();
-}
-
-/* =====================================================================
- * Buzzer control
- * ===================================================================== */
-static void set_buzzer(bool on)
-{
-    gpio_set_level(BUZZER_GPIO, on ? 1 : 0);
-    buzzer_on = on;
-}
-
-/* =====================================================================
- * Check all active slots for alert condition and trigger buzzer
- * ===================================================================== */
-static void check_alerts(void)
-{
-    bool any_alert = false;
-    for (int i = 0; i < TDMA_NUM_SLOTS; i++) {
-        if (slots[i].active && slots[i].last_ppm > ALERT_THRESHOLD_PPM) {
-            slots[i].alert_active = true;
-            any_alert = true;
-        } else {
-            slots[i].alert_active = false;
+        for (int j = 0; j < TDMA_NUM_SLOTS; j++) {
+            if (!slots[j].active) {
+                slot_idx = j;
+                strlcpy(slots[j].node_id, i->valuestring, sizeof(slots[j].node_id));
+                slots[j].active = true;
+                break;
+            }
         }
     }
+    if (slot_idx < 0) {
+        ESP_LOGE(TAG, "No free slot for %s", i->valuestring);
+        cJSON_Delete(root);
+        return;
+    }
 
-    set_buzzer(any_alert);
+    slots[slot_idx].last_ppm = (float)p->valuedouble;
+    slots[slot_idx].last_voltage = (float)v->valuedouble;
+    cJSON_Delete(root);
+
+    /* Alert check */
+    bool any_alert = false;
+    for (int j = 0; j < TDMA_NUM_SLOTS; j++) {
+        if (slots[j].active && slots[j].last_ppm > ALERT_THRESHOLD_PPM) {
+            slots[j].alert_active = true;
+            any_alert = true;
+        } else {
+            slots[j].alert_active = false;
+        }
+    }
+    if (any_alert) {
+        if (!buzzer_is_alerting) start_alert_pattern();
+    } else {
+        buzzer_silence();
+    }
 }
 
 /* =====================================================================
- * Update the 4‑line LCD with system status
+ * Display update
  * ===================================================================== */
 static void update_display(void)
 {
-    char line1[21], line2[21], line3[21], line4[21];
-    int active_idx = -1;
-    int64_t now_us = esp_timer_get_time();
-    int64_t now_ms = now_us / 1000;
+    char l1[21], l2[21], l3[21], l4[21];
+    int active = -1;
+    int64_t now_ms = esp_timer_get_time() / 1000;
 
-    /* Determine which slot is currently active (time‑based) */
+    /* Determine active slot by time */
     for (int i = 0; i < TDMA_NUM_SLOTS; i++) {
-        uint32_t offset = i * TDMA_SLOT_DURATION_MS;
-        int64_t slot_start = (now_ms / TDMA_SLOT_PERIOD_MS) * TDMA_SLOT_PERIOD_MS + offset;
-        int64_t slot_end = slot_start + TDMA_SLOT_DURATION_MS;
-        if (now_ms >= slot_start && now_ms < slot_end) {
-            active_idx = i;
-            break;
-        }
+        uint32_t off = i * TDMA_SLOT_DURATION_MS;
+        int64_t s = (now_ms / TDMA_SLOT_PERIOD_MS) * TDMA_SLOT_PERIOD_MS + off;
+        int64_t e = s + TDMA_SLOT_DURATION_MS;
+        if (now_ms >= s && now_ms < e) { active = i; break; }
     }
 
-    /* Line 1: System info */
-    snprintf(line1, sizeof(line1), "TDMA Air Monitor  ");
-
-    /* Line 2: Active transmitter */
-    if (active_idx >= 0 && slots[active_idx].active) {
-        snprintf(line2, sizeof(line2), ">> %s SENDING << ", slots[active_idx].node_id);
+    strlcpy(l1, "TDMA Air Monitor  ", sizeof(l1));
+    if (active >= 0 && slots[active].active) {
+        snprintf(l2, sizeof(l2), ">> %.7s TX <<", slots[active].node_id);
+        snprintf(l3, sizeof(l3), "%.7s:%4.0fP %3.2fV",
+                 slots[active].node_id,
+                 (double)slots[active].last_ppm,
+                 (double)slots[active].last_voltage);
     } else {
-        snprintf(line2, sizeof(line2), "   Waiting...      ");
+        strlcpy(l2, "   Waiting...      ", sizeof(l2));
+        strlcpy(l3, "No active TX       ", sizeof(l3));
     }
-
-    /* Line 3: Data of active transmitter (or last known) */
-    if (active_idx >= 0 && slots[active_idx].active) {
-        snprintf(line3, sizeof(line3), "%s:%.0fppm %.2fV",
-                 slots[active_idx].node_id,
-                 (double)slots[active_idx].last_ppm,
-                 (double)slots[active_idx].last_voltage);
+    int other = (active == 0) ? 1 : 0;
+    if (slots[other].active) {
+        snprintf(l4, sizeof(l4), "%.7s:%4.0fP %3.2fV",
+                 slots[other].node_id,
+                 (double)slots[other].last_ppm,
+                 (double)slots[other].last_voltage);
     } else {
-        snprintf(line3, sizeof(line3), "No active TX");
+        strlcpy(l4, "                    ", sizeof(l4));
     }
+    lcd_write(l1, l2, l3, l4);
+}
 
-    /* Line 4: Last known data of the other transmitter */
-    int other_idx = (active_idx == 0) ? 1 : 0;
-    if (slots[other_idx].active) {
-        snprintf(line4, sizeof(line4), "%s:%.0fppm %.2fV",
-                 slots[other_idx].node_id,
-                 (double)slots[other_idx].last_ppm,
-                 (double)slots[other_idx].last_voltage);
-    } else {
-        snprintf(line4, sizeof(line4), "                    ");
+static void mqtt_data_handler(const char *topic, const char *data, size_t len)
+{
+    if (strcmp(topic, "airquality/data") == 0) {
+        handle_data(data, len);
     }
+}
 
-    /* Append alert indicator */
-    if (buzzer_on) {
-        strcat(line1, " ALERT!");   /* shorten first line */
+/* ===================================================================== */
+void app_main(void)
+{
+    ESP_ERROR_CHECK(network_start());
+
+    init_lcd();
+    init_buzzer();
+
+    /* Short startup beep */
+    buzzer_tone_simple(1500, 200);
+
+    network_mqtt_set_data_callback(mqtt_data_handler);
+    network_mqtt_subscribe("airquality/data", 1);
+    ESP_LOGI(TAG, "Receiver ready");
+
+    /* Pre-populate slot 0 with dummy? No. */
+    while (1) {
+        update_display();
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
-
-    lcd_write(line1, line2, line3, line4);
 }
