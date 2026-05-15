@@ -7,6 +7,8 @@ idf_component_register(
 
     REQUIRES 
         gas_sensors
+        lcd_i2c
+        buzzer
         network
         driver
         esp_timer

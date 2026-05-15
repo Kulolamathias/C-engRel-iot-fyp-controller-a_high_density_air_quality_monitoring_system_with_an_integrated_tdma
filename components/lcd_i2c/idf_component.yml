@@ -1,0 +1,5 @@
+version: "1.0.0"
+description: "I2C LCD driver for ESP32 with thread safety"
+# url: "https://github.com/kulolamathias/lcd_i2c"
+dependencies:
+  idf: ">=5.0"

@@ -120,6 +120,13 @@ void network_mqtt_set_data_callback(network_mqtt_data_cb_t cb);
  */
 void network_get_node_id(char *buf, size_t buflen, const char *prefix);
 
+/**
+ * @brief Check whether the MQTT client is currently connected to the broker.
+ *
+ * @return true if connected, false otherwise.
+ */
+bool network_mqtt_is_connected(void);
+
 #ifdef __cplusplus
 }
 #endif

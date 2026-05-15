@@ -35,6 +35,7 @@ static const char *TAG = "network";
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 static network_mqtt_data_cb_t    data_cb    = NULL;
 static char                      node_id[16];
+static bool mqtt_connected = false;
 
 /* -------------------------------------------------------------------------
  * Forward declarations
@@ -226,9 +227,11 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
 {
     switch (event_id) {
     case MQTT_EVENT_CONNECTED:
+        mqtt_connected = true;
         ESP_LOGI(TAG, "MQTT connected");
         break;
     case MQTT_EVENT_DISCONNECTED:
+        mqtt_connected = false;
         ESP_LOGW(TAG, "MQTT disconnected");
         break;
     case MQTT_EVENT_DATA: {
@@ -241,4 +244,9 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
     default:
         break;
     }
+}
+
+bool network_mqtt_is_connected(void)
+{
+    return mqtt_connected;
 }
